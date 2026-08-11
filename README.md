@@ -89,7 +89,7 @@ ONNX models used for the model inference described above:
 
 This repository contains all code related to model training. See [`./training`](./training).
 
-### 3. `ana_scripts`
+### 4. `ana_scripts`
 
 This directory contains Jupyter notebooks and Python scripts that use the ntuples and the jet-free model inference scores (from the additional ML framework) to reproduce the figures shown in the paper.
 
