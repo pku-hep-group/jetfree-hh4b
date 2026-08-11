@@ -1,0 +1,1429 @@
+#!/usr/bin/env python
+
+import os
+import ast
+import sys
+import shutil
+import glob
+import argparse
+import functools
+import numpy as np
+import math
+import copy
+import torch
+
+from torch.utils.data import DataLoader
+from utils.logger import _logger, _configLogger
+from utils.dataset import SimpleIterDataset
+from utils.import_tools import import_module
+from utils.data.eval_utils import _register_funcs
+from utils.nn.tools import unwrap_model
+
+# fmt: off
+parser = argparse.ArgumentParser()
+parser.add_argument('--run-mode', type=functools.partial(str.split, sep=','), default='train,val,test',
+                    help='comma-separated list of the steps (train|val|test) to run, e.g., `train,test`')
+parser.add_argument('--regression-mode', action=argparse.BooleanOptionalAction, default=False,
+                    help='run in regression mode if this flag is set; otherwise run in classification mode')
+parser.add_argument('-c', '--data-config', type=str,
+                    help='data config YAML file')
+parser.add_argument('--data-config-val', type=str, default=None,
+                    help='data config YAML file for validation set')
+parser.add_argument('--data-config-test', type=str, default=None,
+                    help='data config YAML file for test set')
+parser.add_argument('--extra-selection-train', type=str, default=None,
+                    help='Additional selection requirement for training, will modify `selection` to `(selection) & (extra)` on-the-fly')
+parser.add_argument('--extra-selection-val', type=str, default=None,
+                    help='Additional selection requirement for validation, will modify `selection` to `(selection) & (extra)` on-the-fly')
+parser.add_argument('--extra-selection-test', type=str, default=None,
+                    help='Additional test-time selection requirement, will modify `test_time_selection` to `(test_time_selection) & (extra)` on-the-fly')
+parser.add_argument('-i', '--data-train', nargs='*', default=[],
+                    help='training files; supported syntax:'
+                         ' (a) plain list, `--data-train /path/to/a/* /path/to/b/*`;'
+                         ' (b) (named) groups [Recommended], `--data-train a:/path/to/a/* b:/path/to/b/*`,'
+                         ' the file splitting (for each dataloader worker) will be performed per group,'
+                         ' and then mixed together, to ensure a uniform mixing from all groups for each worker.'
+                    )
+parser.add_argument('-l', '--data-val', nargs='*', default=[],
+                    help='validation files; when not set, will use training files and split by `--train-val-split`')
+parser.add_argument('-t', '--data-test', nargs='*', default=[],
+                    help='testing files; supported syntax:'
+                         ' (a) plain list, `--data-test /path/to/a/* /path/to/b/*`;'
+                         ' (b) keyword-based, `--data-test a:/path/to/a/* b:/path/to/b/*`, will produce output_a, output_b;'
+                         ' (c) split output per N input files, `--data-test a%%10:/path/to/a/*`, will split per 10 input files')
+parser.add_argument('--data-fraction', type=float, default=1,
+                    help='fraction of events to load from each file; for training, the events are randomly selected for each epoch')
+parser.add_argument('--data-fraction-val', type=float, default=None,
+                    help='--data-fraction for the validation data loader; defaults to --data-fraction if not set')
+parser.add_argument('--file-fraction', type=float, default=1,
+                    help='fraction of files to load; for training, the files are randomly selected for each epoch')
+parser.add_argument('--fetch-by-files', action=argparse.BooleanOptionalAction, default=False,
+                    help='When enabled, will load all events from a small number (set by ``--fetch-step``) of files for each data fetching. '
+                         'Otherwise (default), load a small fraction of events from all files each time, which helps reduce variations in the sample composition.')
+parser.add_argument('--fetch-step', type=float, default=0.01,
+                    help='fraction of events to load each time from every file (when ``--fetch-by-files`` is disabled); '
+                         'Or: number of files to load each time (when ``--fetch-by-files`` is enabled). Shuffling & sampling is done within these events, so set a large enough value.')
+parser.add_argument('--fetch-step-val', type=float, default=None,
+                    help='--fetch-step for the validation data loader.')
+parser.add_argument('--data-split-num', type=int, default=1,
+                    help='for each dataloader worker, split its dataset further into N parts when loading a certain fraction of each file. Setting N > 1 can reduce the workers\' memory usage.')
+parser.add_argument('--data-split-val', type=int, default=None,
+                    help='--data-split-num for the validation data loader.')
+parser.add_argument('--in-memory', action=argparse.BooleanOptionalAction, default=False,
+                    help='load the whole dataset (and perform the preprocessing) only once and keep it in memory for the entire run')
+parser.add_argument('--in-memory-val', action=argparse.BooleanOptionalAction, default=None,
+                    help='--in-memory for the validation data loader')
+parser.add_argument('--train-val-split', type=float, default=0.8,
+                    help='training/validation split fraction')
+parser.add_argument('--no-remake-weights', action='store_true', default=False,
+                    help='do not remake weights for sampling (reweighting), use existing ones in the previous auto-generated data config YAML file')
+parser.add_argument('--demo', action=argparse.BooleanOptionalAction, default=False,
+                    help='quickly test the setup by running over only a small number of events')
+parser.add_argument('--lr-finder', type=str, default=None,
+                    help='run learning rate finder instead of the actual training; format: ``start_lr, end_lr, num_iters``')
+parser.add_argument('--tensorboard', type=str, default=None,
+                    help='create a tensorboard summary writer with the given comment')
+parser.add_argument('--tensorboard-custom-fn', type=str, default=None,
+                    help='the path of the python script containing a user-specified function `get_tensorboard_custom_fn`, '
+                         'to display custom information per mini-batch or per epoch, during the training, validation or test.')
+parser.add_argument('--custom-functions', type=str,
+                    help='python file implementing extra functions for data loading and pre-processing')
+parser.add_argument('-n', '--network-config', type=str,
+                    help='network architecture configuration file')
+parser.add_argument('-o', '--network-option', nargs=2, action='append', default=[],
+                    help='options to pass to the model class constructor, e.g., `--network-option use_counts False`')
+parser.add_argument('-m', '--model-prefix', type=str, default='models/{auto}/network',
+                    help='path to save or load the model; for training, this will be used as a prefix, so model snapshots '
+                         'will saved to `{model_prefix}_epoch-%%d_state.pt` after each epoch, and the one with the best '
+                         'validation metric to `{model_prefix}_best_epoch_state.pt`; for testing, this should be the full path '
+                         'including the suffix, otherwise the one with the best validation metric will be used; '
+                         'for training, `{auto}` can be used as part of the path to auto-generate a name, '
+                         'based on the timestamp and network configuration')
+parser.add_argument('--load-model-weights', type=str, default=None,
+                    help='initialize model with pre-trained weights')
+parser.add_argument('--exclude-model-weights', type=str, default=None,
+                    help='comma-separated regex to exclude matched weights from being loaded, e.g., `a.fc..+,b.fc..+`')
+parser.add_argument('--freeze-model-weights', type=str, default=None,
+                    help='comma-separated regex to freeze matched weights from being updated in the training, e.g., `a.fc..+,b.fc..+`')
+parser.add_argument('--num-epochs', type=int, default=20,
+                    help='number of epochs')
+parser.add_argument('--steps-per-epoch', type=int, default=None,
+                    help='number of steps (iterations) per epochs; '
+                         'if neither of `--steps-per-epoch` or `--samples-per-epoch` is set, each epoch will run over all loaded samples')
+parser.add_argument('--steps-per-epoch-val', type=int, default=None,
+                    help='number of steps (iterations) per epochs for validation; '
+                         'if neither of `--steps-per-epoch-val` or `--samples-per-epoch-val` is set, each epoch will run over all loaded samples')
+parser.add_argument('--samples-per-epoch', type=int, default=None,
+                    help='number of samples per epochs; '
+                         'if neither of `--steps-per-epoch` or `--samples-per-epoch` is set, each epoch will run over all loaded samples')
+parser.add_argument('--samples-per-epoch-val', type=int, default=None,
+                    help='number of samples per epochs for validation; '
+                         'if neither of `--steps-per-epoch-val` or `--samples-per-epoch-val` is set, each epoch will run over all loaded samples')
+parser.add_argument('--optimizer', type=str, default='ranger',
+                    help='optimizer for the training; For any PyTorch built-in optimizer in torch.optim, use the case-sensitive class name, e.g., AdamW')
+parser.add_argument('-p', '--optimizer-option', nargs=2, action='append', default=[],
+                    help='options to pass to the optimizer class constructor, e.g., `--optimizer-option weight_decay 1e-4`')
+parser.add_argument('--lr-scheduler', type=str, default='flat+decay',
+                    choices=['none', 'steps', 'flat+decay', 'flat+linear', 'flat+cos', 'warmup+cos', 'one-cycle', 'cosanneal'],
+                    help='learning rate scheduler')
+parser.add_argument('--warmup-steps', type=float, default=0.25,
+                    help='number of warm-up steps (or fraction of the total steps if <1), only valid for `flat+linear` and `flat+cos` lr schedulers')
+parser.add_argument('--load-epoch', type=int, default=None,
+                    help='used to resume interrupted training, load model and optimizer state saved in the `epoch-%%d_state.pt` and `epoch-%%d_optimizer.pt` files')
+parser.add_argument('--start-lr', type=float, default=5e-3,
+                    help='start learning rate')
+parser.add_argument('--batch-size', type=int, default=128,
+                    help='batch size')
+parser.add_argument('--batch-size-val', type=int, default=None,
+                    help='batch size for validation dataset')
+parser.add_argument('--batch-size-test', type=int, default=None,
+                    help='batch size for test dataset')
+parser.add_argument('--use-amp', action=argparse.BooleanOptionalAction, default=False,
+                    help='use mixed precision training (fp16)')
+parser.add_argument('--amp-dtype', type=str, default='bf16', choices=['fp16', 'bf16'],
+                    help='dtype for mixed precision training (fp16 or bf16)')
+parser.add_argument('--compile', action=argparse.BooleanOptionalAction, default=False,
+                    help='use torch.compile')
+parser.add_argument('--compiler-option', nargs=2, action='append', default=[],
+                    help='options to pass to torch.compile, e.g., `--compiler-option dynamic False`')
+parser.add_argument('--compile-optimizer', action=argparse.BooleanOptionalAction, default=False,
+                    help='use torch.compile to compile the optimizer `step` (experimental); reuses `--compiler-option`. '
+                         'The learning rate is wrapped in a Tensor so that LR-scheduler updates do not trigger '
+                         'recompilation. Works best with foreach/fused-capable optimizers (e.g. AdamW)')
+parser.add_argument('--gpus', type=str, default='0',
+                    help='device for the training/testing; to use CPU, set to empty string (""); to use multiple gpu, set it as a comma separated list, e.g., `1,2,3,4`')
+parser.add_argument('--predict-gpus', type=str, default=None,
+                    help='device for the testing; to use CPU, set to empty string (""); to use multiple gpu, set it as a comma separated list, e.g., `1,2,3,4`; if not set, use the same as `--gpus`')
+parser.add_argument('--num-workers', type=int, default=1,
+                    help='number of threads to load the dataset; memory consumption and disk access load increases (~linearly) with this numbers')
+parser.add_argument('--prefetch-factor', type=int, default=None,
+                    help='number of batches loaded in advance by each DataLoader worker; increase for I/O-bound workloads')
+parser.add_argument('--predict', action=argparse.BooleanOptionalAction, default=False,
+                    help='run prediction instead of training')
+parser.add_argument('--predict-output', type=str,
+                    help='path to save the prediction output, support `.root` and `.parquet` format')
+parser.add_argument('--export-onnx', type=str, default=None,
+                    help='export the PyTorch model to ONNX model and save it at the given path (path must ends w/ .onnx); '
+                         'needs to set `--data-config`, `--network-config`, and `--model-prefix` (requires the full model path)')
+parser.add_argument('--onnx-opset', type=int, default=15,
+                    help='ONNX opset version.')
+parser.add_argument('--io-test', action=argparse.BooleanOptionalAction, default=False,
+                    help='test throughput of the dataloader')
+parser.add_argument('--copy-inputs', action=argparse.BooleanOptionalAction, default=False,
+                    help='copy input files to the current dir (can help to speed up dataloading when running over remote files, e.g., from EOS)')
+parser.add_argument('--log-file', type=str, dest='log', default='',
+                    help='path to the log file; `{auto}` can be used as part of the path to auto-generate a name, based on the timestamp and network configuration')
+parser.add_argument('--print', action=argparse.BooleanOptionalAction, default=False,
+                    help='do not run training/prediction but only print model information, e.g., FLOPs and number of parameters of a model')
+parser.add_argument('--profile', action=argparse.BooleanOptionalAction, default=False,
+                    help='run the profiler')
+parser.add_argument('--backend', type=str, choices=['gloo', 'nccl', 'mpi'], default=None,
+                    help='backend for distributed training')
+parser.add_argument('--cross-validation', type=str, default=None,
+                    help='enable k-fold cross validation; input format: `variable_name%%k`')
+parser.add_argument('--auto-clean', action=argparse.BooleanOptionalAction, default=False,
+                    help='automatically remove the previous checkpoints, keeping only the last epoch and the best epoch')
+# fmt: on
+
+
+def to_filelist(args, mode="train"):
+    if mode == "train":
+        flist = args.data_train
+    elif mode == "val":
+        flist = args.data_val
+    else:
+        raise NotImplementedError("Invalid mode %s" % mode)
+
+    # keyword-based: 'a:/path/to/a b:/path/to/b'
+    file_dict = {}
+    for f in flist:
+        if ":" in f:
+            name, fp = f.split(":")
+        else:
+            name, fp = "_", f
+        files = glob.glob(fp)
+        if name in file_dict:
+            file_dict[name] += files
+        else:
+            file_dict[name] = files
+
+    # sort files
+    for name, files in file_dict.items():
+        file_dict[name] = sorted(files)
+
+    if args.local_rank is not None:
+        if mode == "train" or mode == "val":
+            local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+            new_file_dict = {}
+            for name, files in file_dict.items():
+                new_files = files[args.local_rank :: local_world_size]
+                assert len(new_files) > 0
+                np.random.shuffle(new_files)
+                new_file_dict[name] = new_files
+            file_dict = new_file_dict
+
+    if args.copy_inputs:
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp()
+        if os.path.exists(tmpdir):
+            shutil.rmtree(tmpdir)
+        new_file_dict = {name: [] for name in file_dict}
+        for name, files in file_dict.items():
+            for src in files:
+                dest = os.path.join(tmpdir, src.lstrip("/"))
+                if not os.path.exists(os.path.dirname(dest)):
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy2(src, dest)
+                _logger.info("Copied file %s to %s" % (src, dest))
+                new_file_dict[name].append(dest)
+            if len(files) != len(new_file_dict[name]):
+                _logger.error(
+                    "Only %d/%d files copied for %s file group %s", len(new_file_dict[name]), len(files), mode, name
+                )
+        file_dict = new_file_dict
+
+    filelist = sum(file_dict.values(), [])
+    assert len(filelist) == len(set(filelist))
+    return file_dict, filelist
+
+
+def train_load(args):
+    """
+    Loads the training data.
+    :param args:
+    :return: train_loader, train_data_config, val_loader, val_data_config
+    """
+
+    train_file_dict, train_files = to_filelist(args, "train")
+    if args.data_val:
+        val_file_dict, val_files = to_filelist(args, "val")
+        train_range = val_range = (0, 1)
+    else:
+        val_file_dict, val_files = train_file_dict, train_files
+        train_range = (0, args.train_val_split)
+        val_range = (args.train_val_split, 1)
+    _logger.info("Using %d files for training, range: %s" % (len(train_files), str(train_range)))
+    _logger.info("Using %d files for validation, range: %s" % (len(val_files), str(val_range)))
+
+    if args.demo:
+        train_files = train_files[:20]
+        val_files = val_files[:20]
+        train_file_dict = {"_": train_files}
+        val_file_dict = {"_": val_files}
+        _logger.info(train_files)
+        _logger.info(val_files)
+        args.data_fraction = 0.1
+        args.data_split_num = 1
+        args.fetch_step = 0.002
+
+    if args.in_memory:
+        if args.steps_per_epoch is None:
+            raise RuntimeError("Must set --steps-per-epoch when using --in-memory!")
+        if args.fetch_by_files or args.fetch_step < 1:
+            _logger.warning(
+                "Running with --in-memory, but --fetch-step is set to a value below 1 (or --fetch-by-files is set). "
+                "This means only a fraction of data will be loaded throughout the training.",
+                color="bold",
+            )
+
+    if args.in_memory_val:
+        if args.steps_per_epoch_val is None:
+            raise RuntimeError("Must set --steps-per-epoch-val when using --in-memory-val!")
+        if args.fetch_by_files or args.fetch_step_val < 1:
+            _logger.warning(
+                "Running with --in-memory-val, but --fetch-step-val is set to a value below 1 (or --fetch-by-files is set). "
+                "This means only a fraction of data will be loaded throughout the validation.",
+                color="bold",
+            )
+
+    train_data = SimpleIterDataset(
+        train_file_dict,
+        args.data_config,
+        batch_size=args.batch_size,
+        for_training=True,
+        extra_selection=args.extra_selection_train,
+        remake_weights=not args.no_remake_weights,
+        load_range_and_fraction=(train_range, args.data_fraction, args.data_split_num),
+        file_fraction=args.file_fraction,
+        fetch_by_files=args.fetch_by_files,
+        fetch_step=args.fetch_step,
+        infinity_mode=args.steps_per_epoch is not None,
+        in_memory=args.in_memory,
+        name="train" + ("" if args.local_rank is None else "_rank%d" % args.local_rank),
+    )
+    val_data = SimpleIterDataset(
+        val_file_dict,
+        args.data_config_val,
+        batch_size=args.batch_size_val,
+        for_training=True,
+        extra_selection=args.extra_selection_val,
+        load_range_and_fraction=(val_range, args.data_fraction_val if args.data_fraction_val is not None else args.data_fraction, args.data_split_val),
+        file_fraction=args.file_fraction,
+        fetch_by_files=args.fetch_by_files,
+        fetch_step=args.fetch_step_val,
+        infinity_mode=args.steps_per_epoch_val is not None,
+        in_memory=args.in_memory_val,
+        name="val" + ("" if args.local_rank is None else "_rank%d" % args.local_rank),
+    )
+    num_workers_train = min(args.num_workers, max(1, int(len(train_files) * args.file_fraction)))
+    num_workers_val = min(args.num_workers, max(1, int(len(val_files) * args.file_fraction)))
+    train_loader = DataLoader(
+        train_data,
+        batch_size=args.batch_size,
+        drop_last=True,
+        pin_memory=True,
+        num_workers=num_workers_train,
+        persistent_workers=num_workers_train > 0,
+        prefetch_factor=args.prefetch_factor if num_workers_train > 0 else None,
+    )
+    val_loader = DataLoader(
+        val_data,
+        batch_size=args.batch_size_val,
+        drop_last=True,
+        pin_memory=True,
+        num_workers=num_workers_val,
+        persistent_workers=num_workers_val > 0,
+        prefetch_factor=args.prefetch_factor if num_workers_val > 0 else None,
+    )
+    train_data_config = train_data.config
+    val_data_config = val_data.config
+
+    return train_loader, train_data_config, val_loader, val_data_config
+
+
+def test_load(args):
+    """
+    Loads the test data.
+    :param args:
+    :return: test_loaders, test_data_config
+    """
+    # keyword-based --data-test: 'a:/path/to/a b:/path/to/b'
+    # split --data-test: 'a%10:/path/to/a/*'
+    file_dict = {}
+    split_dict = {}
+    for f in args.data_test:
+        if ":" in f:
+            name, fp = f.split(":")
+            if "%" in name:
+                name, split = name.split("%")
+                split_dict[name] = int(split)
+        else:
+            name, fp = "", f
+        files = glob.glob(fp)
+        if name in file_dict:
+            file_dict[name] += files
+        else:
+            file_dict[name] = files
+
+    # sort files
+    for name, files in file_dict.items():
+        file_dict[name] = sorted(files)
+
+    # apply splitting
+    for name, split in split_dict.items():
+        files = file_dict.pop(name)
+        for i in range((len(files) + split - 1) // split):
+            file_dict[f"{name}_{i}"] = files[i * split : (i + 1) * split]
+
+    def get_test_loader(name):
+        filelist = file_dict[name]
+        _logger.info("Running on test file group %s with %d files:\n...%s", name, len(filelist), "\n...".join(filelist))
+        num_workers = min(args.num_workers, len(filelist))
+        test_data = SimpleIterDataset(
+            {name: filelist},
+            args.data_config_test,
+            for_training=False,
+            extra_selection=args.extra_selection_test,
+            load_range_and_fraction=((0, 1), args.data_fraction, args.data_split_num),
+            fetch_by_files=True,
+            fetch_step=1,
+            name="test_" + name,
+        )
+        test_loader = DataLoader(
+            test_data,
+            num_workers=num_workers,
+            batch_size=args.batch_size_test,
+            drop_last=False,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=args.prefetch_factor if num_workers > 0 else None,
+        )
+        return test_loader
+
+    test_loaders = {name: functools.partial(get_test_loader, name) for name in file_dict}
+    test_data_config = SimpleIterDataset({}, args.data_config_test, for_training=False).config
+    return test_loaders, test_data_config
+
+
+def onnx(args):
+    """
+    Saving model as ONNX.
+    :param args:
+    :return:
+    """
+    assert args.export_onnx.endswith(".onnx")
+    model_path = args.model_prefix
+    _logger.info("Exporting model %s to ONNX" % model_path)
+
+    from utils.dataset import DataConfig
+
+    data_config = DataConfig.load(args.data_config, load_observers=False, load_reweight_info=False)
+    model, model_info, *_ = model_setup(args, data_config)
+    model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    model = model.cpu()
+    model.eval()
+
+    if not os.path.dirname(args.export_onnx):
+        args.export_onnx = os.path.join(os.path.dirname(model_path), args.export_onnx)
+    os.makedirs(os.path.dirname(args.export_onnx), exist_ok=True)
+
+    # Build the dummy inputs used to trace the model. Tracing through an axis of
+    # size 1 makes the exporter specialize/bake that dimension into the graph,
+    # even when it is declared dynamic -- so the exported model would then only
+    # accept that exact size. To keep declared-dynamic axes truly dynamic, trace
+    # with size 2 for any dynamic axis whose configured size is 1 (e.g. the batch
+    # dimension, which is typically 1 in the network config's `input_shapes`).
+    dynamic_axes = model_info.get("dynamic_axes", None)
+
+    def _trace_shape(name, shape):
+        shape = list(shape)
+        axes = (dynamic_axes or {}).get(name, None)
+        if axes is not None:
+            # `dynamic_axes` entries may be a dict {axis: name} or a list [axis, ...]
+            axis_indices = axes.keys() if isinstance(axes, dict) else axes
+            for ax in axis_indices:
+                if shape[ax] == 1:
+                    shape[ax] = 2
+        return shape
+
+    inputs = tuple(
+        torch.ones(_trace_shape(k, model_info["input_shapes"][k]), dtype=torch.float32)
+        for k in model_info["input_names"]
+    )
+    export_kwargs = dict(
+        input_names=model_info["input_names"],
+        output_names=model_info["output_names"],
+        dynamic_axes=dynamic_axes,
+        opset_version=args.onnx_opset,
+    )
+    # Use the legacy TorchScript-based exporter: the models' ONNX code paths
+    # (e.g. `for_onnx` pairwise embedding, manual attention masks) are written
+    # for tracing, and the newer TorchDynamo exporter (the default since recent
+    # PyTorch versions) cannot handle their data-dependent shapes and adds an
+    # `onnxscript` dependency. The `dynamo` kwarg only exists on newer PyTorch,
+    # so set it conditionally for backward compatibility.
+    import inspect
+
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        export_kwargs["dynamo"] = False
+    torch.onnx.export(model, inputs, args.export_onnx, **export_kwargs)
+    _logger.info("ONNX model saved to %s", args.export_onnx)
+
+    preprocessing_json = os.path.join(os.path.dirname(args.export_onnx), "preprocess.json")
+    data_config.export_json(preprocessing_json)
+    _logger.info("Preprocessing parameters saved to %s", preprocessing_json)
+
+
+def flops(model, model_info, device="cpu"):
+    """
+    Count FLOPs and params.
+    :param args:
+    :param model:
+    :param model_info:
+    :return:
+    """
+    from utils.flops_counter import get_model_complexity_info
+    from torch.utils.flop_counter import FlopCounterMode
+    import copy
+
+    model = copy.deepcopy(model).to(device)
+    model.eval()
+
+    inputs = tuple(
+        torch.ones(model_info["input_shapes"][k], dtype=torch.float32, device=device) for k in model_info["input_names"]
+    )
+
+    macs, params = get_model_complexity_info(model, inputs, as_strings=True, print_per_layer_stat=True, verbose=True)
+    _logger.info("{:<30}  {:<8}".format("Computational complexity: ", macs))
+    _logger.info("{:<30}  {:<8}".format("Number of parameters: ", params))
+
+    flop_counter = FlopCounterMode(display=True)
+    with flop_counter:
+        _ = model(*inputs)
+    total_flops = flop_counter.get_total_flops()
+
+    def format_number(n):
+        for unit in ["", "K", "M", "G", "T", "P"]:
+            if abs(n) < 1000:
+                return f"{n:.2f} {unit}"
+            n /= 1000
+        return f"{n:.2f}E"
+
+    _logger.info("{:<30}  {:<8}".format("Total FLOPs: ", format_number(total_flops)))
+
+
+def profile(args, model, model_info, device):
+    """
+    Profile.
+    :param model:
+    :param model_info:
+    :return:
+    """
+    import copy
+    from torch.profiler import profile, record_function, ProfilerActivity
+
+    model = copy.deepcopy(model)
+    model = model.to(device)
+    model.eval()
+
+    inputs = tuple(
+        torch.ones((args.batch_size,) + model_info["input_shapes"][k][1:], dtype=torch.float32).to(device)
+        for k in model_info["input_names"]
+    )
+    for x in inputs:
+        print(x.shape, x.device)
+
+    def trace_handler(p):
+        output = p.key_averages().table(sort_by="self_cuda_time_total", row_limit=50)
+        print(output)
+        p.export_chrome_trace("/tmp/trace_" + str(p.step_num) + ".json")
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=2, warmup=2, active=6, repeat=2),
+        on_trace_ready=trace_handler,
+    ) as p:
+        for idx in range(100):
+            model(*inputs)
+            p.step()
+
+
+def init_opt(args, model, **optimizer_options):
+    # When compiling the optimizer step, the learning rate must be a Tensor: torch.compile guards on the
+    # value of a Python-float lr and would recompile every time the LR scheduler changes it (every step for
+    # the per-step schedulers). A Tensor lr is updated in-place by the schedulers, so its identity is stable.
+    compile_optimizer = getattr(args, "compile_optimizer", False)
+    if compile_optimizer:
+        lr_device = next((p.device for p in model.parameters()), None)
+        start_lr = torch.tensor(args.start_lr, device=lr_device)
+    else:
+        start_lr = args.start_lr
+
+    optimizer_name = args.optimizer.lower()
+    clip_grad_norm = optimizer_options.pop("clip_grad_norm", float("inf"))
+    names_lr_mult = []
+    if optimizer_name == "muon+adamw":
+        if compile_optimizer:
+            raise ValueError("`--compile-optimizer` is not supported with `--optimizer muon+adamw`.")
+        if "lr_mult" in optimizer_options:
+            raise ValueError("`lr_mult` is not supported with `--optimizer muon+adamw`; use `adamw_lr_scale`.")
+
+        no_weight_decay = set(model.no_weight_decay()) if hasattr(model, "no_weight_decay") else set()
+        wd_skip_list = {"pos_embed", "cls_token", "mask_token", "register_token"}
+        muon_params = []
+        adamw_decay_params = []
+        adamw_no_decay_params = []
+        muon_names = []
+        adamw_decay_names = []
+        adamw_no_decay_names = []
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            name_parts = name.split(".")
+            is_transformer_hidden_weight = (
+                param.ndim == 2 and ("blocks" in name_parts or "cls_blocks" in name_parts)
+            )
+            if is_transformer_hidden_weight:
+                muon_params.append(param)
+                muon_names.append(name)
+            elif (
+                param.ndim <= 1
+                or name.endswith(".bias")
+                or name_parts[-1] in wd_skip_list
+                or name in no_weight_decay
+            ):
+                adamw_no_decay_params.append(param)
+                adamw_no_decay_names.append(name)
+            else:
+                adamw_decay_params.append(param)
+                adamw_decay_names.append(name)
+
+        weight_decay = optimizer_options.pop("weight_decay", 0.0)
+        from utils.nn.optimizer.muon_adamw import MuonWithAdamW
+
+        opt = MuonWithAdamW(
+            muon_params,
+            adamw_decay_params,
+            adamw_no_decay_params,
+            lr=start_lr,
+            weight_decay=weight_decay,
+            **optimizer_options,
+        )
+        _logger.info(
+            "Using Muon+AdamW optimizer: %d Muon tensors (%d parameters), "
+            "%d AdamW decay tensors (%d parameters), %d AdamW no-decay tensors (%d parameters)",
+            len(muon_params),
+            sum(p.numel() for p in muon_params),
+            len(adamw_decay_params),
+            sum(p.numel() for p in adamw_decay_params),
+            len(adamw_no_decay_params),
+            sum(p.numel() for p in adamw_no_decay_params),
+        )
+        _logger.info("Muon parameters:\n - %s", "\n - ".join(muon_names))
+        _logger.info("AdamW parameters with weight decay:\n - %s", "\n - ".join(adamw_decay_names))
+        _logger.info("AdamW parameters without weight decay:\n - %s", "\n - ".join(adamw_no_decay_names))
+    elif "weight_decay" in optimizer_options or "lr_mult" in optimizer_options:
+        # https://github.com/rwightman/pytorch-image-models/blob/master/timm/optim/optim_factory.py#L31
+        import re
+
+        decay, no_decay = {}, {}
+        names_no_decay = []
+        wd_skip_list = {"pos_embed", "cls_token", "mask_token", "register_token"}
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue  # frozen weights
+            if (
+                len(param.shape) == 1
+                or name.endswith(".bias")
+                or (name.split(".")[-1] in wd_skip_list)
+                or (hasattr(model, "no_weight_decay") and name in model.no_weight_decay())
+            ):
+                no_decay[name] = param
+                names_no_decay.append(name)
+            else:
+                decay[name] = param
+
+        decay_1x, no_decay_1x = [], []
+        decay_mult, no_decay_mult = [], []
+        mult_factor = 1
+        if "lr_mult" in optimizer_options:
+            pattern, mult_factor = optimizer_options.pop("lr_mult")
+            for name, param in decay.items():
+                if re.match(pattern, name):
+                    decay_mult.append(param)
+                    names_lr_mult.append(name)
+                else:
+                    decay_1x.append(param)
+            for name, param in no_decay.items():
+                if re.match(pattern, name):
+                    no_decay_mult.append(param)
+                    names_lr_mult.append(name)
+                else:
+                    no_decay_1x.append(param)
+            assert len(decay_1x) + len(decay_mult) == len(decay)
+            assert len(no_decay_1x) + len(no_decay_mult) == len(no_decay)
+        else:
+            decay_1x, no_decay_1x = list(decay.values()), list(no_decay.values())
+        wd = optimizer_options.get("weight_decay", 0.0)
+        parameters = [
+            {"params": no_decay_1x, "weight_decay": 0.0},
+            {"params": decay_1x, "weight_decay": wd},
+            {"params": no_decay_mult, "weight_decay": 0.0, "lr": start_lr * mult_factor},
+            {"params": decay_mult, "weight_decay": wd, "lr": start_lr * mult_factor},
+        ]
+        _logger.info("Parameters excluded from weight decay:\n - %s", "\n - ".join(names_no_decay))
+        if len(names_lr_mult):
+            _logger.info("Parameters with lr multiplied by %s:\n - %s", mult_factor, "\n - ".join(names_lr_mult))
+    else:
+        parameters = model.parameters()
+
+    if optimizer_name == "muon+adamw":
+        pass
+    elif optimizer_name == "ranger":
+        from utils.nn.optimizer.ranger import Ranger
+
+        opt = Ranger(parameters, lr=start_lr, **optimizer_options)
+    elif optimizer_name == "adam":
+        opt = torch.optim.Adam(parameters, lr=start_lr, **optimizer_options)
+    elif optimizer_name == "adamw":
+        if "betas" not in optimizer_options:
+            optimizer_options["betas"] = (0.95, 0.999)
+        if "weight_decay" not in optimizer_options:
+            optimizer_options["weight_decay"] = 0
+        _logger.info(f"Using AdamW optimizer w/ options: {str(optimizer_options)}")
+        opt = torch.optim.AdamW(parameters, lr=start_lr, **optimizer_options)
+    elif optimizer_name == "radam":
+        opt = torch.optim.RAdam(parameters, lr=start_lr, **optimizer_options)
+    else:
+        opt = getattr(torch.optim, args.optimizer)(parameters, lr=start_lr, **optimizer_options)
+
+    if args.load_epoch is not None:
+        load_checkpoint(args, model, opt)
+
+    opt._clip_grad_norm = clip_grad_norm
+
+    scheduler = None
+    if args.lr_finder is None:
+        if args.lr_scheduler == "steps":
+            lr_step = round(args.num_epochs / 3)
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                opt,
+                milestones=[lr_step, 2 * lr_step],
+                gamma=0.1,
+                last_epoch=-1 if args.load_epoch is None else args.load_epoch,
+            )
+        elif args.lr_scheduler == "flat+decay":
+            num_decay_epochs = max(1, int(args.num_epochs * 0.3))
+            milestones = list(range(args.num_epochs - num_decay_epochs, args.num_epochs))
+            gamma = 0.01 ** (1.0 / num_decay_epochs)
+            if len(names_lr_mult):
+
+                def get_lr(epoch):
+                    return gamma ** max(0, epoch - milestones[0] + 1)  # noqa
+
+                scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    opt,
+                    (lambda _: 1, lambda _: 1, get_lr, get_lr),
+                    last_epoch=-1 if args.load_epoch is None else args.load_epoch,
+                )
+            else:
+                scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                    opt,
+                    milestones=milestones,
+                    gamma=gamma,
+                    last_epoch=-1 if args.load_epoch is None else args.load_epoch,
+                )
+        elif args.lr_scheduler == "flat+linear" or args.lr_scheduler == "flat+cos":
+            total_steps = args.num_epochs * args.steps_per_epoch
+            warmup_steps = (args.warmup_steps * total_steps) if args.warmup_steps < 1 else args.warmup_steps
+            flat_steps = total_steps * 0.7 - 1
+            min_factor = 0.001
+
+            def lr_fn(step_num):
+                if step_num > total_steps:
+                    raise ValueError(
+                        "Tried to step {} times. The specified number of total steps is {}".format(
+                            step_num + 1, total_steps
+                        )
+                    )
+                if step_num < warmup_steps:
+                    return 1.0 * step_num / warmup_steps
+                if step_num <= flat_steps:
+                    return 1.0
+                pct = (step_num - flat_steps) / (total_steps - flat_steps)
+                if args.lr_scheduler == "flat+linear":
+                    return max(min_factor, 1 - pct)
+                else:
+                    return max(min_factor, 0.5 * (math.cos(math.pi * pct) + 1))
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                opt, lr_fn, last_epoch=-1 if args.load_epoch is None else args.load_epoch * args.steps_per_epoch
+            )
+            scheduler._update_per_step = True  # mark it to update the lr every step, instead of every epoch
+        elif args.lr_scheduler == "warmup+cos":
+            num_training_steps = args.num_epochs * args.steps_per_epoch
+            num_warmup_steps = (args.warmup_steps * num_training_steps) if args.warmup_steps < 1 else args.warmup_steps
+            num_cycles = 0.5
+
+            def lr_lambda(current_step):
+                if current_step < num_warmup_steps:
+                    return float(current_step) / float(max(1, num_warmup_steps))
+                progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                opt, lr_lambda, last_epoch=-1 if args.load_epoch is None else args.load_epoch * args.steps_per_epoch
+            )
+            scheduler._update_per_step = True  # mark it to update the lr every step, instead of every epoch
+        elif args.lr_scheduler == "one-cycle":
+            max_lr = (
+                [group["lr"] for group in opt.param_groups]
+                if optimizer_name == "muon+adamw"
+                else args.start_lr
+            )
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                opt,
+                max_lr=max_lr,
+                epochs=args.num_epochs,
+                steps_per_epoch=args.steps_per_epoch,
+                pct_start=0.3,
+                anneal_strategy="cos",
+                div_factor=25.0,
+                last_epoch=-1 if args.load_epoch is None else args.load_epoch,
+            )
+            scheduler._update_per_step = True  # mark it to update the lr every step, instead of every epoch
+        elif args.lr_scheduler == "cosanneal":
+            base_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                opt,
+                T_0=4,
+                T_mult=2,
+                last_epoch=-1 if args.load_epoch is None else args.load_epoch,
+            )
+            from utils.nn.scheduler.warmup import GradualWarmupScheduler
+
+            scheduler = GradualWarmupScheduler(
+                opt,
+                multiplier=1,
+                warmup_epoch=5,
+                after_scheduler=base_scheduler,
+            )
+
+    if compile_optimizer:
+        compiler_options = {k: ast.literal_eval(v) for k, v in args.compiler_option}
+        _logger.info("Compiling the optimizer step with torch.compile, options: %s" % str(compiler_options))
+        # Wrap `step` in place so the training loop keeps calling `opt.step()` unchanged. `torch.compile`
+        # captures the current `step` callable, so this does not recurse, and `grad_scaler.step(opt)` (fp16
+        # AMP) still routes through the compiled step. This must run *after* the scheduler is constructed:
+        # LR schedulers patch `opt.step` (via `__func__`) at init time and require it to still be a bound
+        # method. The Tensor lr (see `start_lr` above) keeps the scheduler's per-step lr updates from
+        # triggering recompilation.
+        opt.step = torch.compile(opt.step, **compiler_options)
+
+    return opt, scheduler
+
+
+def load_checkpoint(args, model, opt):
+    # load previous training and resume if `--load-epoch` is set
+    _logger.info("Resume training from epoch %d" % args.load_epoch)
+    model_state = torch.load(args.model_prefix + "_epoch-%d_state.pt" % args.load_epoch, map_location="cpu")
+    model.load_state_dict(model_state)
+    opt_state_file = args.model_prefix + "_epoch-%d_optimizer.pt" % args.load_epoch
+    if os.path.exists(opt_state_file):
+        opt_state = torch.load(opt_state_file, map_location="cpu")
+        opt.load_state_dict(opt_state)
+    else:
+        _logger.warning("Optimizer state file %s NOT found!" % opt_state_file)
+
+
+def model_setup(args, data_config, device="cpu"):
+    """
+    Loads the model
+    :param args:
+    :param data_config:
+    :return: model, model_info, network_module, network_options
+    """
+    network_module = import_module(args.network_config, name="_network_module")
+    network_options = {k: ast.literal_eval(v) for k, v in args.network_option}
+    _logger.info("Network options: %s" % str(network_options))
+    if args.export_onnx:
+        network_options["for_inference"] = True
+    if args.use_amp:
+        network_options["use_amp"] = True
+    if args.compile:
+        network_options["compile_model"] = True
+    model, model_info = network_module.get_model(data_config, **network_options)
+    if args.load_model_weights:
+        if ":" in args.load_model_weights:
+            state_file, prefix = args.load_model_weights.split(":")
+            model_state = torch.load(state_file, map_location="cpu")
+            model_state = {
+                k.replace(prefix + ".", "", 1): v for k, v in model_state.items() if k.startswith(prefix + ".")
+            }
+        else:
+            model_state = torch.load(args.load_model_weights, map_location="cpu")
+        if args.exclude_model_weights:
+            import re
+
+            exclude_patterns = args.exclude_model_weights.split(",")
+            _logger.info("The following weights will not be loaded: %s" % str(exclude_patterns))
+            key_state = {}
+            for k in model_state.keys():
+                key_state[k] = True
+                for pattern in exclude_patterns:
+                    if re.match(pattern, k):
+                        key_state[k] = False
+                        break
+            model_state = {k: v for k, v in model_state.items() if key_state[k]}
+        missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
+        _logger.info(
+            "Model initialized with weights from %s\n ... Missing: %s\n ... Unexpected: %s"
+            % (args.load_model_weights, missing_keys, unexpected_keys)
+        )
+    if args.freeze_model_weights:
+        import re
+
+        freeze_patterns = args.freeze_model_weights.split(",")
+        for name, param in model.named_parameters():
+            freeze = False
+            for pattern in freeze_patterns:
+                if re.match(pattern, name):
+                    freeze = True
+                    break
+            if freeze:
+                param.requires_grad = False
+        _logger.info(
+            "The following weights has been frozen:\n - %s",
+            "\n - ".join([name for name, p in model.named_parameters() if not p.requires_grad]),
+        )
+    # _logger.info(model)
+    try:
+        flops(model, model_info, device=device)
+    except Exception as e:
+        _logger.error("Error in flops: %s", str(e))
+    # loss function
+    try:
+        loss_func = network_module.get_loss(data_config, **network_options)
+        _logger.info("Using loss function %s with options %s" % (loss_func, network_options))
+    except AttributeError:
+        loss_func = torch.nn.CrossEntropyLoss()
+        _logger.warning(
+            "Loss function not defined in %s. Will use `torch.nn.CrossEntropyLoss()` by default.", args.network_config
+        )
+    # train / evaluate loop implementation
+    try:
+        train = network_module.get_train_fn(data_config, **network_options)
+        evaluate = network_module.get_evaluate_fn(data_config, **network_options)
+        _logger.info("Using custom train/evaluate functions with options %s" % network_options)
+    except AttributeError:
+        if args.regression_mode:
+            _logger.info("Running in regression mode")
+            from utils.nn.tools import train_regression as train
+            from utils.nn.tools import evaluate_regression as evaluate
+        else:
+            _logger.info("Running in classification mode")
+            from utils.nn.tools import train_classification as train
+            from utils.nn.tools import evaluate_classification as evaluate
+    return model, model_info, loss_func, train, evaluate
+
+
+def optimizer_setup(args, model):
+    """
+    Optimizer and scheduler.
+    :param args:
+    :param model:
+    :return:
+    """
+    optimizer_options = {k: ast.literal_eval(v) for k, v in args.optimizer_option}
+    _logger.info("Optimizer options: %s" % str(optimizer_options))
+
+    network_module = import_module(args.network_config, name="_network_module")
+    try:
+        return network_module.init_opt(args, model, **optimizer_options)
+    except AttributeError:
+        return init_opt(args, model, **optimizer_options)
+
+
+def iotest(args, data_loader):
+    """
+    Io test
+    :param args:
+    :param data_loader:
+    :return:
+    """
+    from tqdm.auto import tqdm
+    from collections import defaultdict
+    from utils.data.tools import _concat
+
+    _logger.info("Start running IO test")
+    monitor_info = defaultdict(list)
+
+    for X, y, Z in tqdm(data_loader):
+        for k, v in Z.items():
+            monitor_info[k].append(v)
+    monitor_info = {k: _concat(v) for k, v in monitor_info.items()}
+    if monitor_info:
+        monitor_output_path = "weaver_monitor_info.parquet"
+        try:
+            import awkward as ak
+
+            ak.to_parquet(ak.Array(monitor_info), monitor_output_path, compression="LZ4", compression_level=4)
+            _logger.info("Monitor info written to %s" % monitor_output_path, color="bold")
+        except Exception as e:
+            _logger.error("Error when writing output parquet file: \n" + str(e))
+
+
+def save_root(args, output_path, data_config, scores, labels, observers):
+    """
+    Saves as .root
+    :param data_config:
+    :param scores:
+    :param labels
+    :param observers
+    :return:
+    """
+    import awkward as ak
+    from utils.data.fileio import _write_root
+
+    output = {}
+    if data_config.label_type == "simple":
+        for idx, label_name in enumerate(data_config.label_value):
+            output[label_name] = labels[data_config.label_names[0]] == idx
+            output["score_" + label_name] = scores[:, idx]
+    else:
+        if scores.ndim <= 2:
+            output["output"] = scores
+        elif scores.ndim == 3:
+            num_classes = len(scores[0, 0, :])
+            try:
+                names = data_config.labels["names"]
+                assert len(names) == num_classes
+            except KeyError:
+                names = [f"class_{idx}" for idx in range(num_classes)]
+            for idx, label_name in enumerate(names):
+                output[label_name] = labels[data_config.label_names[0]] == idx
+                output["score_" + label_name] = scores[:, :, idx]
+        else:
+            output["output"] = scores
+    output.update(labels)
+    output.update(observers)
+
+    try:
+        _write_root(output_path, ak.Array(output))
+        _logger.info("Written output to %s" % output_path, color="bold")
+    except Exception as e:
+        _logger.error("Error when writing output ROOT file: \n" + str(e))
+
+    save_as_parquet = any(v.ndim > 2 for v in output.values())
+    if save_as_parquet:
+        try:
+            ak.to_parquet(
+                ak.Array(output), output_path.replace(".root", ".parquet"), compression="LZ4", compression_level=4
+            )
+            _logger.info(
+                "Written alternative output file to %s" % output_path.replace(".root", ".parquet"), color="bold"
+            )
+        except Exception as e:
+            _logger.error("Error when writing output parquet file: \n" + str(e))
+
+
+def save_parquet(args, output_path, scores, labels, observers):
+    """
+    Saves as parquet file
+    :param scores:
+    :param labels:
+    :param observers:
+    :return:
+    """
+    import awkward as ak
+
+    output = {"scores": scores}
+    output.update(labels)
+    output.update(observers)
+    try:
+        ak.to_parquet(ak.Array(output), output_path, compression="LZ4", compression_level=4)
+        _logger.info("Written output to %s" % output_path, color="bold")
+    except Exception as e:
+        _logger.error("Error when writing output parquet file: \n" + str(e))
+
+
+def _main(args):
+    _logger.info("args:\n - %s", "\n - ".join(str(it) for it in args.__dict__.items()))
+
+    # export to ONNX
+    if args.export_onnx:
+        onnx(args)
+        return
+
+    if args.file_fraction < 1:
+        _logger.warning("Use of `file-fraction` is not recommended in general -- prefer using `data-fraction` instead.")
+
+    # training/testing mode
+    if args.predict:
+        _logger.warning("The `--predict` flag is set. Overriding the `--run-mode` to `test`.")
+        args.run_mode = ["test"]
+    training_mode = any(m in args.run_mode for m in ["train", "val"])
+
+    # device
+    if args.gpus:
+        # distributed training
+        if args.backend is not None:
+            local_rank = args.local_rank
+            torch.cuda.set_device(local_rank)
+            gpus = [local_rank]
+            dev = torch.device(local_rank)
+            torch.distributed.init_process_group(backend=args.backend, device_id=dev)
+            _logger.info(f"Using distributed PyTorch with {args.backend} backend")
+        else:
+            gpus = [int(i) for i in args.gpus.split(",")]
+            dev = torch.device(gpus[0])
+    else:
+        gpus = None
+        dev = torch.device("cpu")
+        try:
+            if torch.backends.mps.is_available():
+                dev = torch.device("mps")
+        except AttributeError:
+            pass
+
+    # load data
+    if training_mode:
+        train_loader, data_config, val_loader, _ = train_load(args)
+    else:
+        test_loaders, data_config = test_load(args)
+
+    if args.io_test:
+        data_loader = train_loader if training_mode else list(test_loaders.values())[0]()
+        iotest(args, data_loader)
+        return
+
+    if args.tensorboard and (args.backend is None or args.local_rank == 0):
+        from utils.nn.tools import TensorboardHelper
+
+        tb = TensorboardHelper(tb_comment=args.tensorboard, tb_custom_fn=args.tensorboard_custom_fn)
+    else:
+        tb = None
+
+    model, model_info, loss_func, train, evaluate = model_setup(args, data_config, device=dev)
+
+    if args.print:
+        return
+
+    if args.profile:
+        profile(args, model, model_info, device=dev)
+        return
+
+    # note: we should always save/load the state_dict of the original model, not the one wrapped by nn.DataParallel
+    # so we do not convert it to nn.DataParallel now
+    orig_model = model
+
+    if training_mode:
+        model = orig_model.to(dev)
+
+        # DistributedDataParallel
+        if args.backend is not None:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=gpus, output_device=local_rank, find_unused_parameters=False
+            )
+
+        # optimizer & learning rate
+        opt, scheduler = optimizer_setup(args, unwrap_model(model))
+
+        # DataParallel
+        if args.backend is None:
+            if gpus is not None and len(gpus) > 1:
+                # model becomes `torch.nn.DataParallel` w/ model.module being the original `torch.nn.Module`
+                model = torch.nn.DataParallel(model, device_ids=gpus)
+            # model = model.to(dev)
+
+        if args.compile:
+            compiler_options = {k: ast.literal_eval(v) for k, v in args.compiler_option}
+            _logger.info("Use torch.compile with options: %s" % str(compiler_options))
+            model = torch.compile(model, **compiler_options)
+
+        # lr finder: keep it after all other setups
+        if args.lr_finder is not None:
+            start_lr, end_lr, num_iter = args.lr_finder.replace(" ", "").split(",")
+            from utils.lr_finder import LRFinder
+
+            lr_finder = LRFinder(
+                model,
+                opt,
+                loss_func,
+                device=dev,
+                input_names=data_config.input_names,
+                label_names=data_config.label_names,
+            )
+            lr_finder.range_test(train_loader, start_lr=float(start_lr), end_lr=float(end_lr), num_iter=int(num_iter))
+            lr_finder.plot(output="lr_finder.png")  # to inspect the loss-learning rate graph
+            return
+
+        # training loop
+        best_valid_metric = np.inf if args.regression_mode else 0
+        grad_scaler = torch.GradScaler("cuda") if args.use_amp and args.amp_dtype == "fp16" else None
+        for epoch in range(args.num_epochs):
+            if args.load_epoch is not None:
+                if epoch <= args.load_epoch:
+                    continue
+            _logger.info("-" * 50)
+
+            if "train" in args.run_mode:
+                _logger.info("Epoch #%d training" % epoch)
+                train(
+                    model,
+                    loss_func,
+                    opt,
+                    scheduler,
+                    train_loader,
+                    dev,
+                    epoch,
+                    steps_per_epoch=args.steps_per_epoch,
+                    grad_scaler=grad_scaler,
+                    tb_helper=tb,
+                    extra_args=locals(),
+                )
+                if args.model_prefix and (args.backend is None or local_rank == 0):
+                    dirname = os.path.dirname(args.model_prefix)
+                    if dirname and not os.path.exists(dirname):
+                        os.makedirs(dirname)
+                    prev_ckpts = glob.glob(args.model_prefix + "_epoch-*.pt") if args.auto_clean else []
+                    ckpt_base_name = f"{args.model_prefix}_epoch-{epoch}"
+                    torch.save(unwrap_model(model).state_dict(), f"{ckpt_base_name}_state.pt")
+                    torch.save(opt.state_dict(), f"{ckpt_base_name}_optimizer.pt")
+                    if os.path.exists(f"{ckpt_base_name}_state.pt") and os.path.exists(
+                        f"{ckpt_base_name}_optimizer.pt"
+                    ):
+                        for f in prev_ckpts:
+                            try:
+                                os.remove(f)
+                            except OSError:
+                                pass
+
+            if "val" in args.run_mode:
+                _logger.info("Epoch #%d validating" % epoch)
+                if "train" not in args.run_mode:
+                    model.load_state_dict(
+                        torch.load(args.model_prefix + "_epoch-%d_state.pt" % epoch, map_location=dev)
+                    )
+                valid_metric = evaluate(
+                    model,
+                    val_loader,
+                    dev,
+                    epoch,
+                    loss_func=loss_func,
+                    steps_per_epoch=args.steps_per_epoch_val,
+                    tb_helper=tb,
+                    extra_args=locals(),
+                )
+                is_best_epoch = (
+                    (valid_metric < best_valid_metric) if args.regression_mode else (valid_metric > best_valid_metric)
+                )
+                if is_best_epoch:
+                    best_valid_metric = valid_metric
+                    if args.model_prefix and (args.backend is None or local_rank == 0):
+                        shutil.copy2(
+                            f"{args.model_prefix}_epoch-{epoch}_state.pt", args.model_prefix + "_best_epoch_state.pt"
+                        )
+                        shutil.copy2(
+                            f"{args.model_prefix}_epoch-{epoch}_optimizer.pt",
+                            args.model_prefix + "_best_epoch_optimizer.pt",
+                        )
+                _logger.info(
+                    "Epoch #%d: Current validation metric: %.5f (best: %.5f)"
+                    % (epoch, valid_metric, best_valid_metric),
+                    color="bold",
+                )
+
+    if "test" in args.run_mode and args.data_test:
+        if args.backend is not None and local_rank != 0:
+            return
+        if training_mode:
+            del train_loader, val_loader
+            test_loaders, data_config = test_load(args)
+
+        if not args.model_prefix.endswith(".onnx"):
+            if args.predict_gpus:
+                gpus = [int(i) for i in args.predict_gpus.split(",")]
+                dev = torch.device(gpus[0])
+            else:
+                gpus = None
+                dev = torch.device("cpu")
+                try:
+                    if torch.backends.mps.is_available():
+                        dev = torch.device("mps")
+                except AttributeError:
+                    pass
+            model = orig_model.to(dev)
+
+            if ":" in args.model_prefix:
+                state_file, prefix = args.model_prefix.split(":")
+                model_state = torch.load(state_file, map_location=dev)
+                model_state = {
+                    k.replace(prefix + ".", "", 1): v for k, v in model_state.items() if k.startswith(prefix + ".")
+                }
+            else:
+                state_file = (
+                    args.model_prefix
+                    if args.model_prefix.endswith(".pt")
+                    else args.model_prefix + "_best_epoch_state.pt"
+                )
+                model_state = torch.load(state_file, map_location=dev)
+            _logger.info("Loading model %s for eval" % state_file)
+            model.load_state_dict(model_state)
+            if gpus is not None and len(gpus) > 1:
+                model = torch.nn.DataParallel(model, device_ids=gpus)
+            model = model.to(dev)
+
+        for name, get_test_loader in test_loaders.items():
+            test_loader = get_test_loader()
+            # run prediction
+            if args.model_prefix.endswith(".onnx"):
+                _logger.info("Loading model %s for eval" % args.model_prefix)
+                from utils.nn.tools import evaluate_onnx
+
+                test_metric, scores, labels, observers = evaluate_onnx(args.model_prefix, test_loader)
+            else:
+                test_metric, scores, labels, observers = evaluate(
+                    model, test_loader, dev, epoch=None, for_training=False, tb_helper=tb, extra_args=locals()
+                )
+            _logger.info("Test metric %.5f" % test_metric, color="bold")
+            del test_loader
+
+            if args.predict_output:
+                if not os.path.dirname(args.predict_output):
+                    predict_output = os.path.join(
+                        os.path.dirname(args.model_prefix), "predict_output", args.predict_output
+                    )
+                else:
+                    predict_output = args.predict_output
+                os.makedirs(os.path.dirname(predict_output), exist_ok=True)
+                if name == "":
+                    output_path = predict_output
+                else:
+                    base, ext = os.path.splitext(predict_output)
+                    output_path = base + "_" + name + ext
+                if output_path.endswith(".root"):
+                    save_root(args, output_path, data_config, scores, labels, observers)
+                else:
+                    save_parquet(args, output_path, scores, labels, observers)
+
+
+def main():
+    args = parser.parse_args()
+
+    if args.batch_size_val is None:
+        args.batch_size_val = args.batch_size
+    if args.batch_size_test is None:
+        args.batch_size_test = args.batch_size
+
+    if args.samples_per_epoch is not None:
+        if args.steps_per_epoch is None:
+            args.steps_per_epoch = args.samples_per_epoch // args.batch_size
+        else:
+            raise RuntimeError("Please use either `--steps-per-epoch` or `--samples-per-epoch`, but not both!")
+
+    if args.samples_per_epoch_val is not None:
+        if args.steps_per_epoch_val is None:
+            args.steps_per_epoch_val = args.samples_per_epoch_val // args.batch_size_val
+        else:
+            raise RuntimeError("Please use either `--steps-per-epoch-val` or `--samples-per-epoch-val`, but not both!")
+
+    if args.steps_per_epoch_val is None and args.steps_per_epoch is not None:
+        args.steps_per_epoch_val = round(
+            args.steps_per_epoch
+            * args.batch_size
+            * (1 - args.train_val_split)
+            / args.train_val_split
+            / args.batch_size_val
+        )
+    if args.steps_per_epoch_val is not None and args.steps_per_epoch_val < 0:
+        args.steps_per_epoch_val = None
+
+    if args.data_config_val is None:
+        args.data_config_val = args.data_config
+    if args.data_config_test is None:
+        args.data_config_test = args.data_config
+
+    if args.fetch_step_val is None:
+        args.fetch_step_val = args.fetch_step
+    if args.data_split_val is None:
+        args.data_split_val = args.data_split_num
+    if args.in_memory_val is None:
+        args.in_memory_val = args.in_memory
+
+    if args.custom_functions is not None:
+        func_module = import_module(args.custom_functions, "_func_module")
+        _register_funcs(func_module)
+
+    if "{auto}" in args.model_prefix or "{auto}" in args.log:
+        import hashlib
+        import time
+
+        model_name = time.strftime("%Y%m%d-%H%M%S") + "_" + os.path.basename(args.network_config).replace(".py", "")
+        if len(args.network_option):
+            model_name = model_name + "_" + hashlib.md5(str(args.network_option).encode("utf-8")).hexdigest()
+        model_name += "_{optim}_lr{lr}_batch{batch}".format(
+            lr=args.start_lr, optim=args.optimizer, batch=args.batch_size
+        )
+        args._auto_model_name = model_name
+        args.model_prefix = args.model_prefix.replace("{auto}", model_name)
+        args.log = args.log.replace("{auto}", model_name)
+        print("Using auto-generated model prefix %s" % args.model_prefix)
+
+    if args.predict_gpus is None:
+        args.predict_gpus = args.gpus
+
+    args.local_rank = None if args.backend is None else int(os.environ.get("LOCAL_RANK", "0"))
+
+    stdout = sys.stdout
+    if args.local_rank is not None:
+        args.log += ".%03d" % args.local_rank
+        if args.local_rank != 0:
+            stdout = None
+    _configLogger("weaver", stdout=stdout, filename=args.log)
+
+    try:
+        if args.cross_validation:
+            model_dir, model_fn = os.path.split(args.model_prefix)
+            if args.predict_output:
+                predict_output_base, predict_output_ext = os.path.splitext(args.predict_output)
+            load_model = args.load_model_weights or None
+            var_name, kfold = args.cross_validation.split("%")
+            kfold = int(kfold)
+            for i in range(kfold):
+                _logger.info(f"\n=== Running cross validation, fold {i} of {kfold} ===")
+                opts = copy.deepcopy(args)
+                opts.model_prefix = os.path.join(f"{model_dir}_fold{i}", model_fn)
+                if args.predict_output:
+                    opts.predict_output = f"{predict_output_base}_fold{i}" + predict_output_ext
+                opts.extra_selection_train = f"{var_name}%{kfold}!={i}"
+                opts.extra_selection_val = opts.extra_selection_train
+                opts.extra_selection_test = f"{var_name}%{kfold}=={i}"
+                if load_model and "{fold}" in load_model:
+                    opts.load_model_weights = load_model.replace("{fold}", f"fold{i}")
+
+                _main(opts)
+        else:
+            _main(args)
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+    finally:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

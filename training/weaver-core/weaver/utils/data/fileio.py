@@ -1,0 +1,204 @@
+import math
+import os
+import awkward as ak
+import tqdm
+import traceback
+from .tools import _concat
+from ..logger import _logger, warn_n_times
+
+
+def _read_hdf5(filepath, branches, load_range=None):
+    import tables
+
+    tables.set_blosc_max_threads(4)
+    with tables.open_file(filepath) as f:
+        outputs = {k: getattr(f.root, k)[:] for k in branches}
+    if load_range is None:
+        load_range = (0, 1)
+    start = math.trunc(load_range[0] * len(outputs[branches[0]]))
+    stop = max(start + 1, math.trunc(load_range[1] * len(outputs[branches[0]])))
+    for k, v in outputs.items():
+        outputs[k] = v[start:stop]
+    return ak.Array(outputs)
+
+
+def _read_root(filepath, branches, load_range=None, treename=None, branch_magic=None):
+    import uproot
+
+    with uproot.open(filepath) as f:
+        if treename is None:
+            treenames = set(
+                [k.split(";")[0] for k, v in f.items() if getattr(v, "classname", "") == "TTree"]
+            )
+            if len(treenames) == 1:
+                treename = treenames.pop()
+            else:
+                raise RuntimeError(
+                    "Need to specify `treename` as more than one trees are found in file %s: %s"
+                    % (filepath, str(treenames))
+                )
+        tree = f[treename]
+        if load_range is not None:
+            start = math.trunc(load_range[0] * tree.num_entries)
+            stop = max(start + 1, math.trunc(load_range[1] * tree.num_entries))
+        else:
+            start, stop = None, None
+        if branch_magic is not None:
+            branch_dict = {}
+            for name in branches:
+                decoded_name = name
+                for src, tgt in branch_magic.items():
+                    if src in decoded_name:
+                        decoded_name = decoded_name.replace(src, tgt)
+                branch_dict[name] = decoded_name
+            outputs = tree.arrays(
+                filter_name=list(branch_dict.values()),
+                entry_start=start,
+                entry_stop=stop,
+            )
+            for name, decoded_name in branch_dict.items():
+                if name != decoded_name:
+                    outputs[name] = outputs[decoded_name]
+        else:
+            outputs = tree.arrays(filter_name=branches, entry_start=start, entry_stop=stop)
+    return outputs
+
+
+def _read_awkd(filepath, branches, load_range=None):
+    import awkward0
+
+    with awkward0.load(filepath) as f:
+        outputs = {k: f[k] for k in branches}
+    if load_range is None:
+        load_range = (0, 1)
+    start = math.trunc(load_range[0] * len(outputs[branches[0]]))
+    stop = max(start + 1, math.trunc(load_range[1] * len(outputs[branches[0]])))
+    for k, v in outputs.items():
+        outputs[k] = ak.from_awkward0(v[start:stop])
+    return ak.Array(outputs)
+
+
+def _read_parquet(filepath, branches, load_range=None):
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(filepath)
+    meta = pf.metadata
+    n_rg = meta.num_row_groups
+
+    if load_range is not None and n_rg > 1:
+        total = meta.num_rows
+        start_row = math.trunc(load_range[0] * total)
+        stop_row = max(start_row + 1, math.trunc(load_range[1] * total))
+        # find which row groups overlap [start_row, stop_row)
+        rg_indices = []
+        row_offset = 0
+        for i in range(n_rg):
+            rg_rows = meta.row_group(i).num_rows
+            rg_end = row_offset + rg_rows
+            if rg_end > start_row and row_offset < stop_row:
+                rg_indices.append(i)
+            row_offset = rg_end
+        tbl = pf.read_row_groups(rg_indices, columns=branches)
+        outputs = ak.from_arrow(tbl)
+        # trim to exact range within the selected row groups
+        rg0_start = sum(meta.row_group(i).num_rows for i in range(rg_indices[0]))
+        local_start = start_row - rg0_start
+        local_stop = local_start + (stop_row - start_row)
+        if local_start > 0 or local_stop < len(outputs):
+            outputs = outputs[local_start:local_stop]
+    else:
+        tbl = pf.read(columns=branches)
+        outputs = ak.from_arrow(tbl)
+        if load_range is not None:
+            start = math.trunc(load_range[0] * len(outputs))
+            stop = max(start + 1, math.trunc(load_range[1] * len(outputs)))
+            outputs = outputs[start:stop]
+    return outputs
+
+
+def _read_files(
+    filelist,
+    branches,
+    load_ranges=None,
+    show_progressbar=False,
+    file_magic=None,
+    **kwargs,
+):
+    branches = list(branches)
+    table = []
+    iterable = tqdm.tqdm(filelist) if show_progressbar else filelist
+
+    # check `load_ranges`:
+    #  - None: load all entries for all files
+    #  - (start, end): the same range for all files
+    #  - a list/tuple of (start, end): different range for each file
+    if load_ranges is None:
+        load_ranges = (None,) * len(filelist)
+    else:
+        if any(isinstance(x, (list, tuple)) for x in load_ranges):
+            assert len(load_ranges) == len(filelist)
+        else:
+            load_ranges = (load_ranges,) * len(filelist)
+    assert all(r is None or (len(r) == 2 and 0 <= r[0] < r[1] <= 1) for r in load_ranges)
+
+    for filepath, load_range in zip(iterable, load_ranges):
+        if load_range is not None and load_range[0] >= load_range[1]:
+            continue
+        ext = os.path.splitext(filepath)[1]
+        if ext not in (".h5", ".root", ".awkd", ".parquet"):
+            raise RuntimeError("File %s of type `%s` is not supported!" % (filepath, ext))
+        try:
+            if ext == ".h5":
+                a = _read_hdf5(filepath, branches, load_range=load_range)
+            elif ext == ".root":
+                a = _read_root(
+                    filepath,
+                    branches,
+                    load_range=load_range,
+                    treename=kwargs.get("treename", None),
+                    branch_magic=kwargs.get("branch_magic", None),
+                )
+            elif ext == ".awkd":
+                a = _read_awkd(filepath, branches, load_range=load_range)
+            elif ext == ".parquet":
+                a = _read_parquet(filepath, branches, load_range=load_range)
+        except Exception as e:
+            a = None
+            _logger.error("When reading file %s:", filepath)
+            _logger.error(traceback.format_exc())
+        if a is not None and file_magic is not None:
+            import re
+
+            for var, value_dict in file_magic.items():
+                if var in a.fields:
+                    warn_n_times(
+                        f"Var `{var}` already defined in the arrays "
+                        f"but will be OVERWRITTEN by file_magic {value_dict}."
+                    )
+                a[var] = 0
+                for fn_pattern, value in value_dict.items():
+                    if re.search(fn_pattern, filepath):
+                        a[var] = value
+                        break
+        if a is not None:
+            table.append(a)
+    table = _concat(table)  # ak.Array
+
+    if len(table) == 0:
+        raise RuntimeError(
+            f"Zero entries loaded when reading files {filelist} with `load_ranges`={load_ranges}."
+        )
+    return table
+
+
+def _write_root(file, table, treename="Events", compression=-1, step=1048576):
+    import uproot
+
+    if compression == -1:
+        compression = uproot.LZ4(4)
+    with uproot.recreate(file, compression=compression) as fout:
+        tree = fout.mktree(treename, {k: table[k].type for k in table.fields})
+        start = 0
+        while start < len(table[table.fields[0]]) - 1:
+            tree.extend({k: table[k][start : start + step] for k in table.fields})
+            start += step

@@ -85,6 +85,10 @@ ONNX models used for the model inference described above:
 
 **Note**: Inference using all reconstructed particles for jet-free models is performed using ntuples as input through an additional ML R&D framework (the [Weaver](https://github.com/hqucms/weaver-core) framework). This framework is used to train these models and produce 138-dimensional outputs for inference samples. The framework itself is not included in this repository, but the trained models are provided in `delphes/models/HH4b/`.
 
+### 3. `training`
+
+This repository contains all code related to model training. See [`./training`](./training).
+
 ### 3. `ana_scripts`
 
 This directory contains Jupyter notebooks and Python scripts that use the ntuples and the jet-free model inference scores (from the additional ML framework) to reproduce the figures shown in the paper.
