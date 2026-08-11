@@ -83,8 +83,6 @@ ONNX models used for the model inference described above:
 - **`Sophon`** and **`SophonAK4`**: large-R and small-R jet tagging models for reproducing CMS resolved and boosted results
 - **`HH4b`**: Three jet-free strategy models (138-class classification) used for ensemble inference
 
-**Note**: Inference using all reconstructed particles for jet-free models is performed using ntuples as input through an additional ML R&D framework (the [Weaver](https://github.com/hqucms/weaver-core) framework). This framework is used to train these models and produce 138-dimensional outputs for inference samples. The framework itself is not included in this repository, but the trained models are provided in `delphes/models/HH4b/`.
-
 ### 3. `training`
 
 This repository contains all code related to model training. See [`./training`](./training).
